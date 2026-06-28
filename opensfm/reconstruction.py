@@ -6,12 +6,13 @@ import enum
 import logging
 import math
 from abc import ABC, abstractmethod
-from collections import defaultdict
+from collections import defaultdict, deque
 from itertools import combinations
 from timeit import default_timer as timer
 from typing import Any, Dict, List, Optional, Set, Tuple, Union
 
 import cv2
+import networkx as nx
 import numpy as np
 from numpy.typing import NDArray
 from opensfm import (
@@ -23,9 +24,11 @@ from opensfm import (
     pysfm,
     reconstruction_helpers as helpers,
     rig,
+    tracking,
     types,
 )
 from opensfm.align import align_reconstruction, apply_similarity
+from opensfm.planar import _compute_planar_homography, Rt_from_H
 from opensfm import context
 from opensfm.dataset_base import DataSetBase
 
@@ -36,6 +39,7 @@ logger: logging.Logger = logging.getLogger(__name__)
 class ReconstructionAlgorithm(str, enum.Enum):
     INCREMENTAL = "incremental"
     TRIANGULATION = "triangulation"
+    PLANAR = "planar"
 
 
 def log_bundle_stats(bundle_type: str, bundle_report: Dict[str, Any]) -> None:
@@ -675,6 +679,118 @@ def retriangulate(
     return report
 
 
+def _planar_triangulate_track(
+    tracks_manager: pymap.TracksManager,
+    reconstruction: types.Reconstruction,
+    track: str,
+    threshold: float,
+    origins: Dict[str, NDArray],
+    rotation_inverses: Dict[str, NDArray],
+) -> None:
+    """Triangulate a track onto the dominant plane and add it to the reconstruction.
+
+    Each bearing is intersected with the main plane (z = 1, normal +z); if the
+    per-view intersections agree within ``threshold`` the averaged point is kept.
+    ``origins`` and ``rotation_inverses`` cache per-shot values across tracks.
+    """
+    os: List[NDArray] = []
+    bs: List[NDArray] = []
+    ids: List[str] = []
+
+    plane_center = np.array([0, 0, 1])
+    plane_normal = np.array([0, 0, 1])
+
+    observations = {
+        shot_id: obs
+        for shot_id, obs in tracks_manager.get_track_observations(track).items()
+        if shot_id in reconstruction.shots
+    }
+    for shot_id, obs in observations.items():
+        shot = reconstruction.shots[shot_id]
+
+        if shot_id in origins:
+            o = origins[shot_id]
+        else:
+            o = shot.pose.get_origin()
+            origins[shot_id] = o
+        os.append(o)
+
+        b = shot.camera.pixel_bearing(np.array(obs.point))
+
+        if shot_id in rotation_inverses:
+            r = rotation_inverses[shot_id]
+        else:
+            r = shot.pose.get_rotation_matrix().T
+            rotation_inverses[shot_id] = r
+        bs.append(r.dot(b))
+        ids.append(shot_id)
+
+    if len(os) >= 2:
+        Xs: List[NDArray] = []
+
+        for i in range(len(os)):
+            o = os[i]
+            b = bs[i]
+            X = np.zeros(3)
+
+            # https://math.stackexchange.com/questions/100439/determine-where-a-vector-will-intersect-a-plane
+            # t == (a1*n1 + a2*n2 + a3*n3 - n1*o1 - n2*o2 - n3*o3)/(d1*n1 + d2*n2 + d3*n3)
+            d = b.dot(plane_normal)
+            if d == 0:
+                continue
+
+            t = (plane_center.dot(plane_normal) - plane_normal.dot(o)) / d
+
+            X[0] = o[0] + b[0] * t
+            X[1] = o[1] + b[1] * t
+            X[2] = o[2] + b[2] * t
+            Xs.append(X)
+
+        if len(Xs) < 2:
+            return
+
+        avgX = np.average(Xs, axis=0)
+        maxDist = np.max([np.linalg.norm(avgX - X) for X in Xs])
+        if maxDist < threshold:
+            reconstruction.create_point(track, avgX)
+            for shot_id in ids:
+                observation = tracks_manager.get_observation(shot_id, track)
+                reconstruction.add_observation(shot_id, track, observation)
+
+
+def retriangulate_planar(
+    tracks_manager: pymap.TracksManager,
+    reconstruction: types.Reconstruction,
+    threshold: float = 0.02,
+) -> Dict[str, Any]:
+    """Retriangulate all points onto the dominant plane."""
+    chrono = Chronometer()
+    report: Dict[str, Any] = {}
+    report["num_points_before"] = len(reconstruction.points)
+
+    reconstruction.points = {}
+
+    all_shots_ids = set(tracks_manager.get_shot_ids())
+
+    # Per-shot caches shared across all tracks.
+    origins: Dict[str, NDArray] = {}
+    rotation_inverses: Dict[str, NDArray] = {}
+
+    tracks: Set[str] = set()
+    for image in reconstruction.shots.keys():
+        if image in all_shots_ids:
+            tracks.update(tracks_manager.get_shot_observations(image).keys())
+    for track in tracks:
+        _planar_triangulate_track(
+            tracks_manager, reconstruction, track, threshold, origins, rotation_inverses
+        )
+
+    report["num_points_after"] = len(reconstruction.points)
+    chrono.lap("retriangulate")
+    report["wall_time"] = chrono.total_time()
+    return report
+
+
 def remove_outliers(
     reconstruction: types.Reconstruction,
     config: Dict[str, Any],
@@ -990,6 +1106,213 @@ def triangulation_reconstruction(
 
     paint_reconstruction(data, tracks_manager, reconstruction)
     return report, [reconstruction]
+
+
+def planar_reconstruction(
+    data: DataSetBase, tracks_manager: pymap.TracksManager
+) -> Tuple[Dict[str, Any], List[types.Reconstruction]]:
+    """Run the entire planar reconstruction pipeline."""
+
+    logger.info("Starting planar reconstruction")
+    report: Dict[str, Any] = {}
+    chrono = Chronometer()
+    images = tracks_manager.get_shot_ids()
+    if len(images) == 0:
+        logger.warning("No images")
+        raise RuntimeError("No images to reconstruct")
+
+    min_inliers = data.config["five_point_algo_min_inliers"]
+
+    data.init_reference(images)
+    bundle_gcp = data.config["bundle_use_gcp"]
+    original_align_method = data.config["align_method"]
+    if data.config["align_method"] == "auto":
+        logger.info("Switching align_method to orientation_prior")
+        data.config["align_method"] = "orientation_prior"
+    if bundle_gcp:
+        data.config["bundle_use_gcp"] = False
+    processes = data.config["processes"]
+    multithread = processes > 1
+
+    gcp = data.load_ground_control_points()
+    common_tracks_data, common_tracks_index = (
+        tracking.np_all_common_tracks_with_features(
+            tracks_manager, min_common=min_inliers
+        )
+    )
+
+    camera_priors = data.load_camera_models()
+    rig_camera_priors = data.load_rig_cameras()
+
+    camera_id = data.load_exif(images[0])["camera"]
+    camera = camera_priors[camera_id]
+
+    K = camera.get_K()
+    K1 = np.linalg.inv(K)
+
+    graph = nx.DiGraph()
+
+    for pair in common_tracks_index:
+        graph.add_node(pair[0])
+        graph.add_node(pair[1])
+        num_tracks, _, _ = common_tracks_index[pair]
+        graph.add_edge(*pair, weight=num_tracks)
+        graph.add_edge(*(tuple(reversed(pair))), weight=num_tracks)
+
+    # Find initial image by looking at the most centralized nodes
+    centrality = sorted(
+        nx.degree_centrality(graph).items(),
+        key=lambda c: (c[1], c[0]),
+        reverse=True,
+    )
+
+    # Compute homography graph
+    central_image = centrality[0][0]
+
+    nodes = deque([central_image])
+    parallel_args: List[
+        Tuple[
+            Tuple[str, str],
+            Dict[Tuple[str, str], Tuple[int, int, int]],
+            NDArray,
+            nx.DiGraph,
+        ]
+    ] = []
+
+    while len(nodes) > 0:
+        node = nodes.popleft()
+        edges = sorted(
+            graph[node].items(),
+            key=lambda e: (e[1]["weight"], e[0]),
+            reverse=True,
+        )
+
+        for n, attrs in edges:
+            # Has this node's homography been computed ?
+            # (is there an edge with an homography connected to this node?)
+            connected = False
+            for e in graph[n]:
+                if "H" in graph[n][e]:
+                    connected = True
+                    break
+
+            if connected:
+                continue
+
+            # Compute H
+            pair = (node, n)
+            if pair not in common_tracks_index:
+                pair = (n, node)
+
+            if pair not in common_tracks_index:
+                # Should never happen?
+                logger.warning("%s not in common tracks" % str(pair))
+                continue
+
+            # Mark edges with candidate pairs to be computed
+            # in parallel
+            if multithread:
+                graph[pair[0]][pair[1]]["H"] = True
+                graph[pair[1]][pair[0]]["H"] = True
+                parallel_args.append(
+                    (pair, common_tracks_index, common_tracks_data, graph)
+                )
+            else:
+                _, H, H1 = _compute_planar_homography(
+                    (pair, common_tracks_index, common_tracks_data, graph)
+                )
+                if H is not None:
+                    graph[pair[0]][pair[1]]["H"] = H
+                    graph[pair[1]][pair[0]]["H"] = H1
+
+            nodes.append(n)
+
+    if multithread:
+        for pair, H, H1 in context.parallel_map(
+            _compute_planar_homography, parallel_args, processes, backend="loky"
+        ):
+            if H is not None:
+                graph[pair[0]][pair[1]]["H"] = H
+                graph[pair[1]][pair[0]]["H"] = H1
+            else:
+                del graph[pair[0]][pair[1]]["H"]
+                del graph[pair[1]][pair[0]]["H"]
+
+    # Remove edges that have no homographies
+    edges = list(nx.edges(graph))
+    for u, v in edges:
+        if "H" not in graph[u][v]:
+            graph.remove_edge(u, v)
+
+    # Remove isolated nodes
+    graph_nodes = list(nx.nodes(graph))
+    for n in graph_nodes:
+        if len(graph[n]) == 0:
+            graph.remove_node(n)
+            logger.info(
+                "Image %s could not be added (not enough overlap with other images)" % n
+            )
+
+    rec = types.Reconstruction()
+    rec.reference = data.load_reference()
+    rec.cameras = camera_priors
+    rec.rig_cameras = rig_camera_priors
+
+    # Compute homography chain for each node in the graph
+    # starting from the center image and add them to the reconstruction
+    logger.info("Creating reconstruction poses from homography graph")
+    for im, graph_path in nx.single_source_shortest_path(
+        graph, central_image
+    ).items():
+        H = np.identity(3)
+        for n1, n2 in zip(graph_path, graph_path[1:]):
+            H = graph[n1][n2]["H"].dot(H)
+
+        R, t = Rt_from_H(H, K, K1)
+
+        shot = rec.create_shot(im, camera_id, pygeometry.Pose(R, t))
+
+        shot.metadata = helpers.get_image_metadata(data, im)
+        shot.scale = 1.0
+
+    # Triangulate and bundle
+    final_bundle_grid = data.config["final_bundle_grid"]
+    retriangulate_planar(tracks_manager, rec, 0.01)
+    logger.info("Triangulated %s points on plane" % len(rec.points))
+    logger.info("Bundle shot poses")
+    bundle_shot_poses(
+        rec, set(rec.shots.keys()), camera_priors, rig_camera_priors, data.config
+    )
+
+    retriangulate(tracks_manager, rec, data.config)
+    logger.info("Reconstructed %s points" % len(rec.points))
+
+    logger.info("Bundle adjustment")
+
+    align_reconstruction(rec, [], data.config)
+    bundle(rec, camera_priors, rig_camera_priors, gcp, final_bundle_grid, data.config)
+    remove_outliers(rec, data.config)
+    retriangulate(tracks_manager, rec, data.config)
+    logger.info("Reconstructed %s points" % len(rec.points))
+
+    if bundle_gcp:
+        data.config["bundle_use_gcp"] = True
+
+    align_reconstruction(rec, gcp, data.config)
+    bundle(rec, camera_priors, rig_camera_priors, gcp, final_bundle_grid, data.config)
+    remove_outliers(rec, data.config)
+
+    align_reconstruction(rec, gcp, data.config)
+    paint_reconstruction(data, tracks_manager, rec)
+
+    # Restore config values mutated above so we don't leak them into the
+    # rest of the run.
+    data.config["align_method"] = original_align_method
+
+    report["decision"] = "Success"
+    report["memory_usage"] = context.current_memory_usage()
+
+    return report, [rec]
 
 
 def _get_common_feature_arrays(

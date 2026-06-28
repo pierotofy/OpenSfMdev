@@ -292,6 +292,53 @@ def all_common_tracks(
     return common_tracks
 
 
+def np_all_common_tracks_with_features(
+    tracks_manager: pymap.TracksManager,
+    min_common: int = 50,
+) -> Tuple[NDArray, Dict[Tuple[str, str], Tuple[int, int, int]]]:
+    """Same as all_common_tracks, but as a flat numpy buffer plus an index.
+
+    Returns:
+        - a flat float buffer in which each common observation occupies 8
+          values: ``(track_id, x1, y1, 1.0, x2, y2, 1.0, 0.0)``. The two ``1.0``
+          entries are homogeneous coordinates; the trailing ``0.0`` pads each
+          record to an 8-value boundary.
+        - an index mapping each image pair to ``(num_tracks, start, end)`` where
+          ``buffer[start:end]`` slices the records for that pair.
+
+    Track ids are stored as floats, so this relies on track ids being numeric
+    strings (as produced by ``create_tracks``).
+    """
+    all_pairs = tracks_manager.get_all_pairs_connectivity().items()
+    common_tracks_data: List[float] = []
+    common_tracks_index: Dict[Tuple[str, str], Tuple[int, int, int]] = {}
+    rec_start = 0
+    for pair, size in all_pairs:
+        if size < min_common:
+            continue
+
+        tuples = tracks_manager.get_all_common_observations(pair[0], pair[1])
+        num_tracks = len(tuples)
+        rec_end = rec_start + num_tracks * 8
+
+        for j in range(num_tracks):
+            pair_track, p1, p2 = tuples[j]
+
+            common_tracks_data.append(float(pair_track))
+            common_tracks_data.append(p1.point[0])
+            common_tracks_data.append(p1.point[1])
+            common_tracks_data.append(1.0)  # Homogeneous
+            common_tracks_data.append(p2.point[0])
+            common_tracks_data.append(p2.point[1])
+            common_tracks_data.append(1.0)  # Homogeneous
+            common_tracks_data.append(0.0)  # Align to 8-value boundary
+
+        common_tracks_index[pair] = (num_tracks, rec_start, rec_end)
+        rec_start = rec_end
+
+    return np.array(common_tracks_data, dtype=np.float64), common_tracks_index
+
+
 def _good_track(track: List[Tuple[str, int]], min_length: int) -> bool:
     if len(track) < min_length:
         return False
